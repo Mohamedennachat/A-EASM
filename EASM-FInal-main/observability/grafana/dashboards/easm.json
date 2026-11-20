@@ -1,0 +1,70 @@
+{
+  "uid": "easm-overview",
+  "title": "EASM Pipeline Overview",
+  "tags": ["easm", "security"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Open Findings",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "targets": [ { "format": "table", "refId": "A", "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" }, "rawQuery": true, "editorMode": "code", "rawSql": "SELECT count(*) AS \"Open Findings\" FROM findings WHERE status <> 'resolved';" } ]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Critical / High (open)",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "targets": [ { "format": "table", "refId": "A", "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" }, "rawQuery": true, "editorMode": "code", "rawSql": "SELECT count(*) AS \"Critical/High\" FROM findings WHERE status <> 'resolved' AND severity IN ('critical','high');" } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Certs Expiring Soon",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } },
+      "targets": [ { "format": "table", "refId": "A", "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" }, "rawQuery": true, "editorMode": "code", "rawSql": "SELECT count(DISTINCT host) AS v FROM scan_certificates WHERE expiring_soon;" } ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Scanner Runs",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [ { "expr": "easm_scanner_runs_total" } ]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Scanner Failures",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "targets": [ { "expr": "easm_scanner_runs_failed_total" } ]
+    },
+    {
+      "id": 6, "type": "piechart", "title": "Open Findings by Severity",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 4 },
+      "targets": [ { "format": "table", "refId": "A", "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" }, "rawQuery": true, "editorMode": "code", "rawSql": "SELECT severity, count(*) AS count FROM findings WHERE status <> 'resolved' GROUP BY severity ORDER BY count DESC;" } ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "New Findings per Scan",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" },
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 4 },
+      "targets": [ { "format": "time_series", "refId": "A", "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" }, "rawQuery": true, "editorMode": "code", "rawSql": "SELECT scan_timestamp AS time, new_findings_count AS \"new findings\", critical_count AS \"critical\", high_count AS \"high\" FROM scan_summary ORDER BY scan_timestamp;" } ]
+    },
+    {
+      "id": 8, "type": "table", "title": "Recent Findings",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 12 },
+      "targets": [ { "format": "table", "refId": "A", "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" }, "rawQuery": true, "editorMode": "code", "rawSql": "SELECT first_seen, category, severity, host, title, times_seen, status FROM findings ORDER BY first_seen DESC LIMIT 30;" } ]
+    },
+    {
+      "id": 9, "type": "table", "title": "Discovered Assets (latest scan)",
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 21 },
+      "targets": [ { "format": "table", "refId": "A", "datasource": { "type": "grafana-postgresql-datasource", "uid": "easmpg" }, "rawQuery": true, "editorMode": "code", "rawSql": "SELECT host, ip, port, scheme, status_code, title, webserver, source FROM scan_assets WHERE scan_timestamp = (SELECT max(scan_timestamp) FROM scan_assets) ORDER BY host, port LIMIT 50;" } ]
+    }
+  ]
+}

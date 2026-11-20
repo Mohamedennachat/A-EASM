@@ -1,0 +1,38 @@
+receivers:
+  # Scrape the scanner + n8n and re-export - puts the OTel Collector
+  # genuinely in the metrics path (faithful to the proposal).
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'easm-scanner'
+          scrape_interval: 15s
+          static_configs:
+            - targets: ['easm_scanner:5001']
+        - job_name: 'n8n'
+          scrape_interval: 15s
+          metrics_path: /metrics
+          static_configs:
+            - targets: ['n8n:5678']
+  # OTLP ingress for anything that wants to push telemetry directly
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus, otlp]
+      processors: [batch]
+      exporters: [prometheus, debug]

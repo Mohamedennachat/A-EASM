@@ -1,0 +1,993 @@
+{
+  "id": "easm-pipeline",
+  "name": "EASM Security Pipeline - Full",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node_manual",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -220,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24,
+              "triggerAtHour": 2
+            }
+          ]
+        }
+      },
+      "id": "node_schedule",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "run-easm",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "node_webhook",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        600
+      ],
+      "webhookId": "04e0495d-fb40-4b6a-b6e7-feba85b13008"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, domain, status, priority FROM domains WHERE status = 'active' ORDER BY priority ASC, RANDOM() LIMIT 50;",
+        "options": {}
+      },
+      "id": "node_get_domains",
+      "name": "Get Active Domains",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        0,
+        380
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "easm-pg",
+          "name": "EASM Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst domains = items.map(i => ({ id: i.json.id, domain: String(i.json.domain).trim() })).filter(d => d.domain);\nreturn [{ json: {\n  started_at: new Date().toISOString(),\n  domain_count: domains.length,\n  domains,\n  domains_space: domains.map(d => d.domain).join(' '),\n  domains_newline: domains.map(d => d.domain).join('\\n')\n}}];"
+      },
+      "id": "node_aggregate",
+      "name": "Aggregate Domains",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCANNER_URL }}/run",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({cmd: 'for d in ' + $json.domains_space + '; do echo \"$d\"; subfinder -silent -d \"$d\" 2>/dev/null; curl -s --max-time 20 \"https://crt.sh/?q=%25.$d&output=json\" 2>/dev/null | jq -r \".[].name_value\" 2>/dev/null | sed \"s/[*][.]//g\"; done | sort -u | head -200', timeout: 300}) }}",
+        "options": {
+          "timeout": 320000
+        }
+      },
+      "id": "node_discovery",
+      "name": "Passive Discovery (subfinder+crt.sh)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        440,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = ($input.first().json.stdout || '').trim();\nlet subs = raw.split('\\n').map(s => s.trim().toLowerCase()).filter(s => /^[a-z0-9][a-z0-9.-]*\\.[a-z]{2,}$/.test(s));\nsubs = [...new Set(subs)].slice(0, 40);\nreturn [{ json: {\n  subdomain_count: subs.length,\n  subdomains: subs,\n  subdomains_newline: subs.join('\\n'),\n  subdomains_list: subs.join(',')\n}}];"
+      },
+      "id": "node_parse_discovery",
+      "name": "Parse Discovery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const subs = ($input.first().json.subdomains || []).slice(0, 30);\nconst web = subs.map(s => `https://${s}`);\nreturn [{ json: {\n  subdomains: subs,\n  subdomains_newline: subs.join('\\n'),\n  web_targets: web,\n  targets_newline: web.join('\\n'),\n  target_count: web.length\n}}];"
+      },
+      "id": "node_web_targets",
+      "name": "Prepare Web Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCANNER_URL }}/run",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({cmd: 'echo \"' + $json.subdomains_newline + '\" | tlsx -silent -json -san -cn 2>/dev/null || true', timeout: 180}) }}",
+        "options": {
+          "timeout": 200000
+        }
+      },
+      "id": "node_tlsx",
+      "name": "tlsx Certificate Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1120,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.stdout || '';\nconst certs = [], expSoon = [], expired = [];\nfor (const line of raw.split('\\n')) {\n  const t = line.trim();\n  if (!t.startsWith('{')) continue;\n  try {\n    const c = JSON.parse(t);\n    let days = null;\n    if (c.not_after) days = Math.floor((new Date(c.not_after) - new Date()) / 86400000);\n    const isExp = days !== null && days < 0;\n    const e = { host: c.host || '', common_name: c.subject_cn || '', san: c.subject_an || [], issuer: c.issuer_cn || '', not_after: c.not_after || '', days_until_expiry: days, is_expired: isExp, expiring_soon: days !== null && days >= 0 && days <= 30 };\n    certs.push(e);\n    if (e.expiring_soon) expSoon.push(e);\n    if (isExp) expired.push(e);\n  } catch (e) {}\n}\nreturn [{ json: { total_certs_scanned: certs.length, expiring_soon_count: expSoon.length, expired_count: expired.length, cert_results: certs, expiring_soon: expSoon, expired: expired } }];"
+      },
+      "id": "node_parse_tlsx",
+      "name": "Parse tlsx",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCANNER_URL }}/run",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({cmd: 'SUBS=\"' + $('Prepare Web Targets').first().json.subdomains_newline + '\"; echo \"===HTTPX===\"; echo \"$SUBS\" | httpx -silent -json -sc -title -td 2>/dev/null | head -40; echo \"===NAABU===\"; echo \"$SUBS\" | naabu -silent -json -p 80,443,8080,8443,22,21,3306,8000 2>/dev/null | head -80; echo \"===SHODAN===\"; FIRST=$(echo \"$SUBS\" | head -1); IP=$(getent hosts \"$FIRST\" 2>/dev/null | awk \"{print \\$1}\" | head -1); if [ -n \"$IP\" ] && [ -n \"$SHODAN_API_KEY\" ]; then curl -s --max-time 20 \"https://api.shodan.io/shodan/host/$IP?key=$SHODAN_API_KEY\" 2>/dev/null; fi', timeout: 240}) }}",
+        "options": {
+          "timeout": 260000
+        }
+      },
+      "id": "node_enrich",
+      "name": "Recon Enrichment (httpx+naabu+shodan)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1120,
+        560
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.stdout || '';\nconst httpxPart = (raw.split('===HTTPX===')[1] || '').split('===NAABU===')[0] || '';\nconst naabuPart = (raw.split('===NAABU===')[1] || '').split('===SHODAN===')[0] || '';\nconst shodanPart = (raw.split('===SHODAN===')[1] || '').trim();\nconst assets = [];\nlet live = 0, openPorts = 0;\nfor (const l of httpxPart.split('\\n')) { const t = l.trim(); if (!t.startsWith('{')) continue; try { const j = JSON.parse(t); live++; assets.push({ host: j.host || j.input || '', ip: j.host_ip || '', port: parseInt(j.port) || 0, scheme: j.scheme || '', status_code: j.status_code || 0, title: String(j.title || '').substring(0,200), webserver: j.webserver || '', tech: Array.isArray(j.tech) ? j.tech.join(',') : '', source: 'httpx' }); } catch (e) {} }\nfor (const l of naabuPart.split('\\n')) { const t = l.trim(); if (!t.startsWith('{')) continue; try { const j = JSON.parse(t); openPorts++; assets.push({ host: j.host || '', ip: j.ip || '', port: j.port || 0, scheme: '', status_code: 0, title: '', webserver: '', tech: '', source: 'naabu' }); } catch (e) {} }\nlet shodan = null;\ntry { const sj = JSON.parse(shodanPart); if (sj && sj.ip_str) { shodan = { ip: sj.ip_str, org: sj.org || '', os: sj.os || '', ports: sj.ports || [] }; assets.push({ host: (sj.hostnames || [])[0] || '', ip: sj.ip_str, port: (sj.ports || [])[0] || 0, scheme: '', status_code: 0, title: String(sj.org || '').substring(0,200), webserver: '', tech: 'shodan', source: 'shodan' }); } } catch (e) {}\nreturn [{ json: { live_hosts: live, open_ports: openPorts, assets, shodan } }];"
+      },
+      "id": "node_parse_enrich",
+      "name": "Parse Enrichment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCANNER_URL }}/run",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({cmd: 'echo \"' + $('Prepare Web Targets').first().json.subdomains_newline + '\" | nuclei -silent -jsonl -tags cve,ssl,exposure -severity critical,high,medium,low -timeout 5 2>/dev/null || true', timeout: 600}) }}",
+        "options": {
+          "timeout": 620000
+        }
+      },
+      "id": "node_nuclei",
+      "name": "Nuclei Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1340,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.stdout || '';\nconst all = [], crit = [], high = [], med = [];\nfor (const line of raw.split('\\n')) {\n  const t = line.trim();\n  if (!t.startsWith('{')) continue;\n  try {\n    const f = JSON.parse(t);\n    const info = f.info || {};\n    const cls = info.classification || {};\n    const e = { host: f.host || '', url: f['matched-at'] || f.url || '', template_id: f['template-id'] || '', template_name: info.name || '', severity: info.severity || '', description: String(info.description || '').substring(0,400), cve_id: cls['cve-id'] || [], cvss_score: cls['cvss-score'] || '', timestamp: f.timestamp || new Date().toISOString() };\n    all.push(e);\n    if (e.severity === 'critical') crit.push(e);\n    else if (e.severity === 'high') high.push(e);\n    else if (e.severity === 'medium') med.push(e);\n  } catch (e) {}\n}\nreturn [{ json: { total_findings: all.length, critical_count: crit.length, high_count: high.length, medium_count: med.length, all_findings: all, critical_findings: crit, high_findings: high, medium_findings: med } }];"
+      },
+      "id": "node_parse_nuclei",
+      "name": "Parse Nuclei",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCANNER_URL }}/run",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({cmd: 'D=/tmp/nikto_$$; mkdir -p $D; i=0; for url in $(echo \"' + $('Prepare Web Targets').first().json.targets_newline + '\" | head -3); do i=$((i+1)); nikto -h \"$url\" -Format json -o \"$D/$i.json\" -nointeractive -Tuning 1,2,3,b -maxtime 45 >/dev/null 2>&1; done; jq -c \".[]\" $D/*.json 2>/dev/null; rm -rf $D', timeout: 400}) }}",
+        "options": {
+          "timeout": 420000
+        }
+      },
+      "id": "node_nikto",
+      "name": "Nikto Fingerprint",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        1780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.stdout || '';\nconst findings = [];\nfor (const line of raw.split('\\n')) {\n  const t = line.trim();\n  if (!t.startsWith('{')) continue;\n  try {\n    const r = JSON.parse(t);\n    const vulns = r.vulnerabilities || [];\n    for (const v of vulns) {\n      findings.push({ host: r.host || '', ip: r.ip || '', port: r.port || '', banner: r.server_banner || '', osvdb_id: v.id || '', method: v.method || '', url: v.url || '', msg: v.msg || '' });\n    }\n  } catch (e) {}\n}\nreturn [{ json: { total_nikto_findings: findings.length, all_nikto_findings: findings } }];"
+      },
+      "id": "node_parse_nikto",
+      "name": "Parse Nikto",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCANNER_URL }}/run",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({cmd: 'for url in $(echo \"' + $('Prepare Web Targets').first().json.targets_newline + '\" | head -4); do python3 /opt/xssmap/xssmap.py --url \"$url\" --level 1 --output json --timeout 10 2>/dev/null; done', timeout: 400}) }}",
+        "options": {
+          "timeout": 420000
+        }
+      },
+      "id": "node_xssmap",
+      "name": "XSSMap Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        2220,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.stdout || '';\nconst xss = [], confirmed = [];\nfor (const line of raw.split('\\n')) {\n  const t = line.trim();\n  if (!t.startsWith('{')) continue;\n  try {\n    const r = JSON.parse(t);\n    for (const v of (r.vulnerabilities || [])) {\n      const e = { url: v.url || r.url || '', parameter: v.parameter || '', payload: v.payload || '', xss_type: v.type || 'reflected', severity: 'high', confirmed: v.confirmed || false };\n      xss.push(e);\n      if (e.confirmed) confirmed.push(e);\n    }\n  } catch (e) {}\n}\nreturn [{ json: { total_xss_findings: xss.length, confirmed_xss_count: confirmed.length, all_xss_findings: xss, confirmed_xss: confirmed } }];"
+      },
+      "id": "node_parse_xss",
+      "name": "Parse XSS",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2440,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCANNER_URL }}/run",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({cmd: 'for url in $(echo \"' + $('Prepare Web Targets').first().json.targets_newline + '\" | head -2); do echo \"===SQLTARGET:$url===\"; timeout 200 sqlmap -u \"$url\" --crawl=1 --forms --batch --level=1 --risk=1 --technique=BEU --smart -v0 --timeout=15 --retries=1 2>/dev/null; done', timeout: 700}) }}",
+        "options": {
+          "timeout": 720000
+        }
+      },
+      "id": "node_sqlmap",
+      "name": "SQLMap Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        2660,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.stdout || '';\nconst sqli = [], confirmed = [], dbmsFp = [];\nconst targetBlocks = raw.split('===SQLTARGET:');\nfor (const tb of targetBlocks) {\n  if (!tb.trim()) continue;\n  const urlMatch = tb.match(/^([^=]+)===/);\n  const targetUrl = urlMatch ? urlMatch[1].trim() : '';\n  let dbms = '';\n  const dbmsM = tb.match(/back-end DBMS:\\s*([^\\n]+)/i);\n  if (dbmsM) dbms = dbmsM[1].trim();\n  const paramBlocks = tb.split(/Parameter:\\s*/).slice(1);\n  for (const pb of paramBlocks) {\n    const nameM = pb.match(/^([^\\(]+)\\(([^\\)]+)\\)/);\n    const param = nameM ? nameM[1].trim() : '';\n    const typeM = pb.match(/Type:\\s*([^\\n]+)/);\n    const titleM = pb.match(/Title:\\s*([^\\n]+)/);\n    const payloadM = pb.match(/Payload:\\s*([^\\n]+)/);\n    const e = { url: targetUrl, parameter: param, injection_type: typeM ? typeM[1].trim() : '', title: titleM ? titleM[1].trim() : '', payload: payloadM ? payloadM[1].trim() : '', dbms, dbms_version: '', technique: typeM ? typeM[1].trim() : '', severity: 'critical', confirmed: true };\n    sqli.push(e); confirmed.push(e);\n    if (dbms) dbmsFp.push({ software: dbms, version: '', host: targetUrl });\n  }\n}\nreturn [{ json: { total_sqli_findings: sqli.length, confirmed_sqli_count: confirmed.length, all_sqli_findings: sqli, confirmed_sqli: confirmed, dbms_fingerprints: dbmsFp } }];"
+      },
+      "id": "node_parse_sqlmap",
+      "name": "Parse SQLMap",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const tlsx = $('Parse tlsx').first().json;\nconst nuclei = $('Parse Nuclei').first().json;\nconst nikto = $('Parse Nikto').first().json;\nconst xss = $('Parse XSS').first().json;\nconst sqli = $('Parse SQLMap').first().json;\nlet enrich = { assets: [], live_hosts: 0, open_ports: 0, shodan: null };\ntry { enrich = $('Parse Enrichment').first().json; } catch (e) {}\nconst scan_timestamp = new Date().toISOString();\nreturn [{ json: {\n  scan_timestamp,\n  total_certs_scanned: tlsx.total_certs_scanned || 0,\n  expiring_soon_count: tlsx.expiring_soon_count || 0,\n  expired_count: tlsx.expired_count || 0,\n  expiring_soon: tlsx.expiring_soon || [],\n  expired_certs: tlsx.expired || [],\n  all_cert_results: tlsx.cert_results || [],\n  total_vuln_findings: nuclei.total_findings || 0,\n  critical_count: nuclei.critical_count || 0,\n  high_count: nuclei.high_count || 0,\n  medium_count: nuclei.medium_count || 0,\n  critical_findings: nuclei.critical_findings || [],\n  high_findings: nuclei.high_findings || [],\n  medium_findings: nuclei.medium_findings || [],\n  all_findings: nuclei.all_findings || [],\n  total_nikto_findings: nikto.total_nikto_findings || 0,\n  all_nikto_findings: nikto.all_nikto_findings || [],\n  total_xss_findings: xss.total_xss_findings || 0,\n  confirmed_xss_count: xss.confirmed_xss_count || 0,\n  confirmed_xss: xss.confirmed_xss || [],\n  all_xss_findings: xss.all_xss_findings || [],\n  total_sqli_findings: sqli.total_sqli_findings || 0,\n  confirmed_sqli_count: sqli.confirmed_sqli_count || 0,\n  confirmed_sqli: sqli.confirmed_sqli || [],\n  all_sqli_findings: sqli.all_sqli_findings || [],\n  live_hosts: enrich.live_hosts || 0,\n  open_ports: enrich.open_ports || 0,\n  assets: enrich.assets || [],\n  shodan: enrich.shodan || null\n}}];"
+      },
+      "id": "node_merge",
+      "name": "Merge All Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3100,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Merge All Results').first().json;\nconst esc = s => String(s == null ? '' : s).replace(/'/g, \"''\");\nconst byKey = {};\nconst rows = [];\nconst add = (category, key, host, url, identifier, severity, title, finding) => {\n  if (byKey[key]) return; byKey[key] = { category, host, url, identifier, severity, title, ...finding };\n  rows.push(`('${esc(key)}','${category}','${esc(host)}','${esc(url)}','${esc(identifier)}','${esc(severity)}','${esc(String(title).substring(0,300))}')`);\n};\nfor (const f of (d.all_findings || [])) add('vuln', `vuln|${f.host}|${f.template_id}|${f.url}`, f.host, f.url, f.template_id, f.severity, f.template_name, f);\nfor (const x of (d.all_xss_findings || [])) add('xss', `xss|${x.url}|${x.parameter}`, x.url, x.url, x.parameter, 'high', `XSS ${x.parameter}`, x);\nfor (const s of (d.all_sqli_findings || [])) add('sqli', `sqli|${s.url}|${s.parameter}`, s.url, s.url, s.parameter, 'critical', `SQLi ${s.parameter}`, s);\nfor (const c of (d.expiring_soon || [])) add('cert', `cert|${c.host}|${c.common_name}|soon`, c.host, '', c.common_name, c.days_until_expiry <= 7 ? 'high' : 'medium', `Cert expiring ${c.days_until_expiry}d`, c);\nfor (const c of (d.expired_certs || [])) add('cert', `cert|${c.host}|${c.common_name}|expired`, c.host, '', c.common_name, 'high', 'Cert expired', c);\nlet query;\nif (rows.length > 0) {\n  query = `INSERT INTO findings (finding_key, category, host, url, identifier, severity, title) VALUES ${rows.join(',')} ON CONFLICT (finding_key) DO UPDATE SET last_seen = now(), times_seen = findings.times_seen + 1, status = 'active' RETURNING finding_key, (xmax = 0) AS is_new;`;\n} else {\n  query = \"SELECT NULL::text AS finding_key, false AS is_new WHERE false;\";\n}\nreturn [{ json: { query, findings_by_key: byKey, total_keys: rows.length } }];"
+      },
+      "id": "node_diff_prepare",
+      "name": "Diff Prepare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3320,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.query }}",
+        "options": {}
+      },
+      "id": "node_diff_upsert",
+      "name": "Diff Upsert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        3540,
+        380
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "easm-pg",
+          "name": "EASM Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst map = $('Diff Prepare').first().json.findings_by_key || {};\nconst isNew = r => r.is_new === true || r.is_new === 't' || r.is_new === 1 || r.is_new === 'true';\nconst newKeys = rows.filter(isNew).map(r => r.finding_key);\nconst nf = newKeys.map(k => map[k]).filter(Boolean);\nconst pick = (cat, sev) => nf.filter(f => f.category === cat && (!sev || f.severity === sev));\nconst critical_findings = pick('vuln', 'critical');\nconst high_findings = pick('vuln', 'high');\nconst medium_findings = pick('vuln', 'medium');\nconst confirmed_xss = pick('xss');\nconst confirmed_sqli = pick('sqli');\nconst certNew = pick('cert');\nconst expiring_soon = certNew.filter(c => !c.is_expired);\nconst expired_certs = certNew.filter(c => c.is_expired);\nconst requires_alert = nf.length > 0;\nreturn [{ json: {\n  scan_timestamp: $('Merge All Results').first().json.scan_timestamp,\n  new_findings_count: nf.length,\n  requires_alert,\n  critical_count: critical_findings.length,\n  high_count: high_findings.length,\n  medium_count: medium_findings.length,\n  confirmed_xss_count: confirmed_xss.length,\n  confirmed_sqli_count: confirmed_sqli.length,\n  expiring_soon_count: expiring_soon.length,\n  expired_count: expired_certs.length,\n  critical_findings, high_findings, medium_findings, new_findings: nf,\n  confirmed_xss, confirmed_sqli, expiring_soon, expired_certs,\n  total_certs_scanned: $('Merge All Results').first().json.total_certs_scanned || 0\n}}];"
+      },
+      "id": "node_apply_diff",
+      "name": "Apply Diff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3760,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Merge All Results').first().json;\nconst nd = $('Apply Diff').first().json;\nconst ts = d.scan_timestamp;\nconst startedAt = ($('Aggregate Domains').first().json.started_at) || ts;\nconst dur = Math.max(0, Math.round((new Date(ts) - new Date(startedAt))/1000));\nconst esc = s => String(s == null ? '' : s).replace(/'/g, \"''\");\nconst rows = [];\nrows.push({ json: { query: `INSERT INTO scan_summary (scan_timestamp, total_certs_scanned, expiring_soon_count, expired_count, critical_count, high_count, medium_count, confirmed_xss_count, confirmed_sqli_count, total_exploits_found, new_findings_count, requires_alert, started_at, duration_seconds) VALUES ('${ts}', ${d.total_certs_scanned||0}, ${d.expiring_soon_count||0}, ${d.expired_count||0}, ${d.critical_count||0}, ${d.high_count||0}, ${d.medium_count||0}, ${d.confirmed_xss_count||0}, ${d.confirmed_sqli_count||0}, ${d.confirmed_sqli_count||0}, ${nd.new_findings_count||0}, ${nd.requires_alert||false}, '${startedAt}', ${dur});` } });\nfor (const f of (d.all_findings||[])) rows.push({ json: { query: `INSERT INTO scan_vulnerabilities (host,url,template_id,template_name,severity,description,scan_timestamp,requires_alert) VALUES ('${esc(f.host)}','${esc(f.url)}','${esc(f.template_id)}','${esc(f.template_name)}','${esc(f.severity)}','${esc(String(f.description).substring(0,500))}','${ts}',${f.severity==='critical'||f.severity==='high'}) ON CONFLICT DO NOTHING;` } });\nfor (const c of (d.all_cert_results||[])) rows.push({ json: { query: `INSERT INTO scan_certificates (host,common_name,issuer,not_after,days_until_expiry,is_expired,expiring_soon,scan_timestamp) VALUES ('${esc(c.host)}','${esc(c.common_name)}','${esc(c.issuer)}',${c.not_after?`'${esc(c.not_after)}'`:'NULL'},${c.days_until_expiry==null?'NULL':c.days_until_expiry},${c.is_expired||false},${c.expiring_soon||false},'${ts}') ON CONFLICT DO NOTHING;` } });\nfor (const x of (d.all_xss_findings||[])) rows.push({ json: { query: `INSERT INTO scan_xss (url,parameter,payload,xss_type,severity,confirmed,scan_timestamp) VALUES ('${esc(x.url)}','${esc(x.parameter)}','${esc(String(x.payload).substring(0,200))}','${esc(x.xss_type)}','high',${x.confirmed||false},'${ts}');` } });\nfor (const s of (d.all_sqli_findings||[])) rows.push({ json: { query: `INSERT INTO scan_sqli (url,parameter,injection_type,dbms,dbms_version,technique,severity,confirmed,scan_timestamp) VALUES ('${esc(s.url)}','${esc(s.parameter)}','${esc(s.injection_type)}','${esc(s.dbms)}','${esc(s.dbms_version)}','${esc(s.technique)}','critical',${s.confirmed||false},'${ts}');` } });\nfor (const a of (d.assets||[])) rows.push({ json: { query: `INSERT INTO scan_assets (host,ip,port,scheme,status_code,title,webserver,tech,source,scan_timestamp) VALUES ('${esc(a.host)}','${esc(a.ip)}',${a.port||0},'${esc(a.scheme)}',${a.status_code||0},'${esc(a.title)}','${esc(a.webserver)}','${esc(a.tech)}','${esc(a.source)}','${ts}');` } });\nreturn rows.length ? rows : [{ json: { query: 'SELECT 1;' } }];"
+      },
+      "id": "node_prepare_db",
+      "name": "Prepare DB Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3980,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.query }}",
+        "options": {}
+      },
+      "id": "node_save_db",
+      "name": "Save to PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        4200,
+        380
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "easm-pg",
+          "name": "EASM Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $('Apply Diff').first().json.requires_alert }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "node_if_alert",
+      "name": "IF New Findings",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        4420,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $('Apply Diff').first().json;\nconst scanDate = new Date(data.scan_timestamp).toUTCString();\nlet vulnRows = '';\nfor (const v of (data.critical_findings||[])) vulnRows += `<tr style='background:#ffe6e6'><td>${v.host}</td><td>${v.template_name}</td><td><b style='color:red'>CRITICAL</b></td><td>${(v.cve_id||[]).join(', ')||'N/A'}</td></tr>`;\nfor (const v of (data.high_findings||[])) vulnRows += `<tr style='background:#fff3e6'><td>${v.host}</td><td>${v.template_name}</td><td><b style='color:orange'>HIGH</b></td><td>${(v.cve_id||[]).join(', ')||'N/A'}</td></tr>`;\nlet certRows = '';\nfor (const c of (data.expiring_soon||[])) certRows += `<tr style='background:#fffbe6'><td>${c.host}</td><td>${c.common_name}</td><td>${c.not_after}</td><td>${c.days_until_expiry} days</td></tr>`;\nfor (const c of (data.expired_certs||[])) certRows += `<tr style='background:#ffe6e6'><td>${c.host}</td><td>${c.common_name}</td><td>${c.not_after}</td><td><b style='color:red'>EXPIRED</b></td></tr>`;\nlet xssRows = '';\nfor (const x of (data.confirmed_xss||[])) xssRows += `<tr style='background:#ffe6e6'><td>${x.url}</td><td>${x.parameter}</td><td>${x.xss_type}</td></tr>`;\nlet sqliRows = '';\nfor (const s of (data.confirmed_sqli||[])) sqliRows += `<tr style='background:#ffe6e6'><td>${s.url}</td><td>${s.parameter}</td><td>${s.dbms}</td></tr>`;\nconst html = `<!DOCTYPE html><html><head><style>body{font-family:Arial;margin:20px;color:#333}.header{background:#1a1a2e;color:#fff;padding:20px;border-radius:8px}table{width:100%;border-collapse:collapse;margin:15px 0}th{background:#1a1a2e;color:#fff;padding:8px;text-align:left}td{padding:8px;border-bottom:1px solid #ddd}h3{color:#1a1a2e}</style></head><body><div class='header'><h1>EASM Security Scan - New Findings</h1><p>${scanDate}</p><p><b>${data.new_findings_count}</b> new finding(s) since last scan</p></div>${vulnRows?`<h3>Vulnerabilities</h3><table><tr><th>Host</th><th>Vulnerability</th><th>Severity</th><th>CVE</th></tr>${vulnRows}</table>`:''}${certRows?`<h3>Certificates</h3><table><tr><th>Host</th><th>CN</th><th>Expiry</th><th>Status</th></tr>${certRows}</table>`:''}${xssRows?`<h3>XSS</h3><table><tr><th>URL</th><th>Param</th><th>Type</th></tr>${xssRows}</table>`:''}${sqliRows?`<h3>SQL Injection</h3><table><tr><th>URL</th><th>Param</th><th>DBMS</th></tr>${sqliRows}</table>`:''}<p style='color:#888;font-size:12px'>Automated EASM pipeline · stateful diff engine suppressed already-known findings.</p></body></html>`;\nlet subject;\nif ((data.critical_count||0) > 0 || (data.confirmed_sqli_count||0) > 0) subject = `[CRITICAL] EASM - ${data.critical_count} crit / ${data.confirmed_sqli_count} SQLi (new)`;\nelse if ((data.high_count||0) > 0 || (data.confirmed_xss_count||0) > 0) subject = `[HIGH] EASM - ${data.high_count} high / ${data.confirmed_xss_count} XSS (new)`;\nelse subject = `[NOTICE] EASM - ${data.new_findings_count} new finding(s)`;\nreturn [{ json: { subject, html_body: html, discord_color: (data.critical_count||0)>0?15158332:(data.high_count||0)>0?15105570:16776960, critical_count: data.critical_count||0, high_count: data.high_count||0, medium_count: data.medium_count||0, confirmed_xss_count: data.confirmed_xss_count||0, confirmed_sqli_count: data.confirmed_sqli_count||0, expiring_soon_count: data.expiring_soon_count||0, expired_count: data.expired_count||0, new_findings_count: data.new_findings_count||0, scan_timestamp: data.scan_timestamp } }];"
+      },
+      "id": "node_build_alert",
+      "name": "Build Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4640,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.SMTP_SENDER }}",
+        "toEmail": "={{ $json.tier === 'high' ? ($env.EMAIL_HIGH + ',' + $env.EMAIL_OWNER) : ($json.tier === 'medium' ? ($env.EMAIL_MEDIUM + ',' + $env.EMAIL_OWNER) : ($env.EMAIL_LOW + ',' + $env.EMAIL_OWNER)) }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html_body }}",
+        "options": {}
+      },
+      "id": "node_send_email",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [
+        4860,
+        80
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "easm-smtp",
+          "name": "EASM SMTP"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ username: 'EASM Security Scanner', embeds: [{ title: $json.subject, color: $json.discord_color, timestamp: $json.scan_timestamp, fields: [ {name: 'Critical', value: String($json.critical_count), inline: true}, {name: 'High', value: String($json.high_count), inline: true}, {name: 'Medium', value: String($json.medium_count), inline: true}, {name: 'XSS', value: String($json.confirmed_xss_count), inline: true}, {name: 'SQLi', value: String($json.confirmed_sqli_count), inline: true}, {name: 'Expiring Certs', value: String($json.expiring_soon_count), inline: true} ], footer: {text: 'EASM Pipeline · ' + $json.new_findings_count + ' new'} }] }) }}",
+        "options": {}
+      },
+      "id": "node_discord",
+      "name": "Discord Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        4860,
+        220
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Apply Diff').first().json;\nconst nf = d.new_findings || [];\nconst g = { high: [], medium: [], low: [] };\nfor (const f of nf) { const s = String(f.severity||'low').toLowerCase(); if (s==='high'||s==='critical') g.high.push(f); else if (s==='medium') g.medium.push(f); else g.low.push(f); }\nconst label = { high: 'High / Critical', medium: 'Medium', low: 'Low' };\nconst out = [];\nfor (const tier of ['high','medium','low']) {\n  const fs = g[tier];\n  if (!fs.length) continue;\n  let rows = '';\n  for (const f of fs) rows += `<tr><td>${f.category}</td><td><b>${f.severity}</b></td><td>${f.host||''}</td><td>${f.title||f.identifier||''}</td></tr>`;\n  const html = `<!DOCTYPE html><html><body style='font-family:Arial;color:#222'><div style='background:#1a1a2e;color:#fff;padding:16px;border-radius:8px'><h2>EASM - ${label[tier]} findings</h2><p>${fs.length} new finding(s)</p></div><table style='width:100%;border-collapse:collapse;margin-top:12px' border='1' cellpadding='7'><tr style='background:#eee'><th>Category</th><th>Severity</th><th>Host</th><th>Finding</th></tr>${rows}</table><p style='color:#888;font-size:12px'>Automated EASM pipeline · ${d.scan_timestamp}</p></body></html>`;\n  out.push({ json: { tier, count: fs.length, subject: `[EASM ${label[tier]}] ${fs.length} new finding(s)`, html_body: html } });\n}\nreturn out;"
+      },
+      "id": "node_route_emails",
+      "name": "Route Emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4860,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const nf = $('Apply Diff').first().json.new_findings || [];\nconst out = [];\nfor (const f of nf) {\n  const sev = String(f.severity||'low').toLowerCase();\n  const name = f.title || f.identifier || f.category;\n  out.push({ json: { summary: `[${sev.toUpperCase()}] ${name} - ${f.host||''}`.substring(0,250), description: `Category: ${f.category}\\nSeverity: ${sev}\\nHost: ${f.host||''}\\nURL: ${f.url||''}\\nIdentifier: ${f.identifier||''}\\n\\nRaised automatically by the EASM pipeline.`, severity: sev, subtask_summary: `[${sev}] Remediate: ${name}`.substring(0,250) } });\n}\nreturn out;"
+      },
+      "id": "node_prepare_jira",
+      "name": "Prepare Jira Tickets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4860,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/2/issue",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "jiraSoftwareCloudApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fields: { project: { id: $env.JIRA_PROJECT_ID }, issuetype: { id: $env.JIRA_TASK_ISSUETYPE_ID }, summary: $json.summary, description: $json.description, assignee: { accountId: $env.JIRA_ACCT_OWNER } } }) }}",
+        "options": {}
+      },
+      "id": "node_jira_parent",
+      "name": "Create Jira Parent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        5080,
+        380
+      ],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "easm-jira",
+          "name": "EASM Jira"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const parents = $input.all();\nconst src = $('Prepare Jira Tickets').all();\nconst out = [];\nfor (let i = 0; i < parents.length; i++) {\n  const p = parents[i].json;\n  const key = p.key || (p.body && p.body.key);\n  const s = src[i] ? src[i].json : {};\n  if (!key) continue;\n  out.push({ json: { parent_key: key, summary: s.subtask_summary || 'Remediate finding', severity: s.severity || 'low' } });\n}\nreturn out;"
+      },
+      "id": "node_prepare_subtask",
+      "name": "Prepare Subtask",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5300,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/2/issue",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "jiraSoftwareCloudApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fields: { project: { id: $env.JIRA_PROJECT_ID }, issuetype: { id: $env.JIRA_SUBTASK_ISSUETYPE_ID }, parent: { key: $json.parent_key }, summary: $json.summary, assignee: { accountId: ($json.severity === 'high' || $json.severity === 'critical') ? $env.JIRA_ACCT_HIGH : ($json.severity === 'medium' ? $env.JIRA_ACCT_MEDIUM : $env.JIRA_ACCT_LOW) } } }) }}",
+        "options": {}
+      },
+      "id": "node_jira_subtask",
+      "name": "Create Jira Subtask",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        5520,
+        380
+      ],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "easm-jira",
+          "name": "EASM Jira"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "id": "node_no_op",
+      "name": "No New Findings",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        4640,
+        520
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Active Domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Active Domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Active Domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Active Domains": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Domains": {
+      "main": [
+        [
+          {
+            "node": "Passive Discovery (subfinder+crt.sh)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Passive Discovery (subfinder+crt.sh)": {
+      "main": [
+        [
+          {
+            "node": "Parse Discovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Discovery": {
+      "main": [
+        [
+          {
+            "node": "Prepare Web Targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Web Targets": {
+      "main": [
+        [
+          {
+            "node": "tlsx Certificate Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "tlsx Certificate Scan": {
+      "main": [
+        [
+          {
+            "node": "Parse tlsx",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse tlsx": {
+      "main": [
+        [
+          {
+            "node": "Recon Enrichment (httpx+naabu+shodan)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recon Enrichment (httpx+naabu+shodan)": {
+      "main": [
+        [
+          {
+            "node": "Parse Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Enrichment": {
+      "main": [
+        [
+          {
+            "node": "Nuclei Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nuclei Scan": {
+      "main": [
+        [
+          {
+            "node": "Parse Nuclei",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Nuclei": {
+      "main": [
+        [
+          {
+            "node": "Nikto Fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nikto Fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Parse Nikto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Nikto": {
+      "main": [
+        [
+          {
+            "node": "XSSMap Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "XSSMap Scan": {
+      "main": [
+        [
+          {
+            "node": "Parse XSS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse XSS": {
+      "main": [
+        [
+          {
+            "node": "SQLMap Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SQLMap Scan": {
+      "main": [
+        [
+          {
+            "node": "Parse SQLMap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse SQLMap": {
+      "main": [
+        [
+          {
+            "node": "Merge All Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge All Results": {
+      "main": [
+        [
+          {
+            "node": "Diff Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Diff Prepare": {
+      "main": [
+        [
+          {
+            "node": "Diff Upsert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Diff Upsert": {
+      "main": [
+        [
+          {
+            "node": "Apply Diff",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Diff": {
+      "main": [
+        [
+          {
+            "node": "Prepare DB Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare DB Rows": {
+      "main": [
+        [
+          {
+            "node": "Save to PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to PostgreSQL": {
+      "main": [
+        [
+          {
+            "node": "IF New Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF New Findings": {
+      "main": [
+        [
+          {
+            "node": "Build Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Route Emails",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Jira Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No New Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Alert": {
+      "main": [
+        [
+          {
+            "node": "Discord Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Emails": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Jira Tickets": {
+      "main": [
+        [
+          {
+            "node": "Create Jira Parent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Jira Parent": {
+      "main": [
+        [
+          {
+            "node": "Prepare Subtask",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Subtask": {
+      "main": [
+        [
+          {
+            "node": "Create Jira Subtask",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

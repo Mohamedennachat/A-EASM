@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EASM Pipeline - Control Center</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">🛡️ <b>EASM</b> Pipeline <span class="sub">Control Center</span></div>
+    <div class="services" id="services"></div>
+    <div class="run-group">
+      <label class="watch-toggle" title="Live canvas mode: open the workflow in n8n and click 'Execute workflow' to arm it, then Run Scan to watch the nodes animate.">
+        <input type="checkbox" id="watchToggle"> Watch in n8n
+      </label>
+      <button id="runBtn" class="run-btn">▶ Run Scan</button>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button class="active" data-tab="overview">Overview</button>
+    <button data-tab="targets">Targets</button>
+    <button data-tab="findings">Findings</button>
+    <button data-tab="assets">Assets</button>
+    <button data-tab="certs">Certificates</button>
+    <button data-tab="history">Scan History</button>
+  </nav>
+
+  <main>
+    <section id="overview" class="tab active">
+      <div class="cards" id="statCards"></div>
+      <div class="panel">
+        <h3>Pipeline</h3>
+        <div class="pipeline" id="pipeline"></div>
+        <div class="scan-status" id="scanStatus"></div>
+      </div>
+      <div class="panel">
+        <h3>Last scan</h3>
+        <div id="lastScan"></div>
+      </div>
+      <div class="links">
+        <a href="http://localhost:5678" target="_blank">n8n workflow ↗</a>
+        <a href="http://localhost:3000" target="_blank">Grafana ↗</a>
+        <a href="http://localhost:9090" target="_blank">Prometheus ↗</a>
+      </div>
+    </section>
+
+    <section id="targets" class="tab">
+      <div class="panel">
+        <h3>Add authorized target</h3>
+        <div class="add-form">
+          <input id="newDomain" placeholder="example.com - apex domain you are authorized to scan">
+          <button id="addBtn">Add target</button>
+        </div>
+        <p class="warn">⚠ Active scanners attempt exploitation (sqlmap, dalfox, nikto). Only scan domains you own or have written authorization for.</p>
+      </div>
+      <div class="panel"><h3>Targets</h3><div id="domainsTable"></div></div>
+    </section>
+
+    <section id="findings" class="tab">
+      <div class="panel">
+        <h3>Findings <span class="muted" id="findingsCount"></span></h3>
+        <div id="findingsTable"></div>
+      </div>
+    </section>
+
+    <section id="assets" class="tab">
+      <div class="panel"><h3>Discovered assets <span class="muted">httpx · naabu · shodan</span></h3><div id="assetsTable"></div></div>
+    </section>
+
+    <section id="certs" class="tab">
+      <div class="panel"><h3>TLS certificates</h3><div id="certsTable"></div></div>
+    </section>
+
+    <section id="history" class="tab">
+      <div class="panel">
+        <h3>Scan history - the diff engine in action</h3>
+        <p class="muted">Each run alerts only on <b>new</b> findings; already-known findings are suppressed (alert-fatigue reduction).</p>
+        <div id="historyTable"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="modal" class="modal-overlay" onclick="if(event.target===this)closeModal()">
+    <div class="modal"><button class="modal-x" onclick="closeModal()">✕</button><div id="modalBody"></div></div>
+  </div>
+  <div id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
